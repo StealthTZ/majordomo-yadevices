@@ -7,6 +7,38 @@
 Define('YADEVICES_COOKIE_PATH', ROOT . "cms/yadevices/cookie.txt");
 const GLAGOL_PORT = 1961;
 
+/*
+ * Версия модуля. Выводится в шапке панели и в журнале фонового цикла,
+ * чтобы установленную сборку можно было определить, не сверяя файлы.
+ */
+const YADEVICES_VERSION = '0.2.0';
+const YADEVICES_VERSION_DATE = '2026-09-09';
+
+/*
+ * Таймауты обращений к облаку Яндекс, в секундах.
+ * CONNECT — только установка соединения (DNS, TCP, TLS): недоступный хост
+ * должен отваливаться быстро. TIMEOUT — вся операция вместе с передачей тела.
+ */
+const API_CONNECT_TIMEOUT = 5;
+const API_TIMEOUT = 15;
+
+/*
+ * Минимальный интервал между автоматическими обновлениями списка устройств,
+ * которые заказывает receiveQuasar(). Одного вызова refreshDevices() хватает,
+ * чтобы добавить сразу все устройства и все умения, поэтому повторы в пределах
+ * этого интервала бессмысленны.
+ */
+const REFRESH_MIN_INTERVAL = 60;
+
+/*
+ * Как часто повторяющийся отказ связи с облаком попадает в «Ошибки системы».
+ * Потеря связи — состояние внешней среды, а не сбой модуля: на мобильном
+ * подключении она нормальна и повторяется десятки раз за сутки. Первый отказ
+ * и затем один раз в этот интервал записываются как ошибка, промежуточные —
+ * как информационное сообщение. Смена причины отказа сбрасывает интервал.
+ */
+const NETWORK_REPORT_INTERVAL = 900;
+
 spl_autoload_register(function ($class_name) {
     $path = DIR_MODULES . 'yadevices/' . $class_name . '.php';
     $path = str_replace('\\', '/', $path);
@@ -23,6 +55,7 @@ use \WSSC\Components\ClientConfig;
  * @author Wizard <sergejey@gmail.com>
  * @copyright http://majordomo.smartliving.ru/ (c)
  * @version 0.1 (wizard, 15:12:58 [Dec 31, 2019])
+ * @version 0.2.0
  */
 //
 //
@@ -43,6 +76,17 @@ class yadevices extends module
     public $bgcolor;
     public $textcolor;
     public $csrf_token;
+    /* Диагностика последнего обращения к API Яндекс: HTTP-код, ошибка curl,
+     * время запроса и начало ответа. Заполняется в apiRequest(), читается
+     * в сообщениях об ошибках, чтобы по журналу можно было понять причину. */
+    public $api_last_error = '';
+    /* Время последней попытки обновить список устройств — для ограничения
+     * частоты автообновлений из receiveQuasar(). */
+    public $last_refresh_time = 0;
+    /* Когда и о какой причине отказа связи последний раз сообщали
+     * в «Ошибки системы» — чтобы одинаковые записи не копились. */
+    public $last_network_report = 0;
+    public $last_network_signature = '';
 
     /**
      * yadevices
@@ -240,6 +284,9 @@ class yadevices extends module
     function admin(&$out)
     {
         $this->getConfig();
+		$out['MODULE_VERSION'] = YADEVICES_VERSION;
+		$out['MODULE_VERSION_DATE'] = YADEVICES_VERSION_DATE;
+		$out['PHP_VERSION'] = PHP_VERSION;
 		$out['API_USERNAME'] = $this->config['API_USERNAME'] ?? '';
 		$out['OAUTH_TOKEN'] = $this->config['OAUTH_TOKEN'] ?? '';
 		
@@ -367,7 +414,7 @@ class yadevices extends module
 					$rec_device = SQLSelectOne("SELECT * FROM yadevices WHERE IOT_ID = '" . dbSafe($device['id']) . "'");
 					if(empty($rec_device['ID'])){
 						//Если такого устройства нет, обновляем девайсы
-						$this->refreshDevices();
+						$this->refreshDevicesThrottled();
 						continue;
 					}
 					//добавим статус в массив для дальнейшей обработки
@@ -404,7 +451,7 @@ class yadevices extends module
 							}
 							$req_skills = SQLSelectOne("SELECT * FROM yadevices_capabilities WHERE TITLE = '" . dbSafe($c_type) . "' AND YADEVICE_ID = " . (int)$rec_device['ID']);
 							if(empty($req_skills['ID'])) {
-								$this->refreshDevices();
+								$this->refreshDevicesThrottled();
 								continue;
 							}
 							//Основные умения, меняем значение
@@ -472,8 +519,68 @@ class yadevices extends module
 		}
 	}
 	
+    /*
+     * Сообщение об отказе обращения к облаку.
+     * Отсутствие ответа («HTTP 0») означает потерю связи: отказ DNS, нет
+     * маршрута, таймаут соединения. Это внешнее обстоятельство, и записывать
+     * его в «Ошибки системы» на каждой попытке смысла нет — за ночь набегают
+     * десятки одинаковых строк, среди которых теряются настоящие ошибки.
+     * Первый отказ и затем один раз в NETWORK_REPORT_INTERVAL идут как ошибка,
+     * промежуточные — как информационное сообщение. Если причина отказа
+     * сменилась (другой код curl), сообщаем сразу.
+     * Ответ от облака с ошибкой в теле регистрируется всегда: это уже не связь.
+     */
+    function reportApiFailure($prefix)
+    {
+		$message = $prefix . ' ' . $this->api_last_error;
+		if (strpos((string)$this->api_last_error, 'HTTP 0') !== 0) {
+			$this->writeLog($message, true);
+			return;
+		}
+		/* Признак причины должен быть грубым. На мобильном подключении код curl
+		   произвольно чередуется между 6 (имя не разрешилось), 7 (соединиться
+		   не удалось) и 28 (таймаут) — это одно и то же обстоятельство «связи нет».
+		   Различая их, ограничение частоты не работало вовсе: каждая попытка
+		   выглядела новой причиной и попадала в «Ошибки системы».
+		   Остальные коды (TLS, сертификат, протокол) — уже другая проблема,
+		   о них сообщаем сразу. */
+		$no_link = array(6, 7, 28);
+		if (preg_match('/curl #(\d+)/', (string)$this->api_last_error, $m)) {
+			$signature = in_array((int)$m[1], $no_link) ? 'no-link' : 'curl' . $m[1];
+		} else {
+			$signature = 'no-link';
+		}
+		if ($signature === $this->last_network_signature
+			&& (time() - (int)$this->last_network_report) < NETWORK_REPORT_INTERVAL) {
+			$this->writeLog($message);
+			return;
+		}
+		$this->last_network_signature = $signature;
+		$this->last_network_report = time();
+		$this->writeLog($message, true);
+    }
+
+    /*
+     * Обновление списка устройств с ограничением частоты.
+     * receiveQuasar() заказывает обновление внутри двух вложенных циклов:
+     * для каждого незнакомого устройства и для каждого незнакомого умения.
+     * Одно сообщение от облака про устройство с шестью новыми умениями давало
+     * шесть полных запросов всего списка домов подряд, хотя список умений
+     * заполняется целиком уже первым из них. При недоступной сети каждый такой
+     * запрос — это ожидание до API_CONNECT_TIMEOUT и отдельная запись
+     * в «Ошибках системы».
+     */
+    function refreshDevicesThrottled()
+    {
+		if ((time() - (int)$this->last_refresh_time) < REFRESH_MIN_INTERVAL) {
+			return false;
+		}
+		return $this->refreshDevices();
+    }
+
     function refreshDevices()
     {
+		$this->last_refresh_time = time();
 		$this->getConfig();
 		if(empty($this->config['AUTHORIZED'])) return false;
 		$this->writeLog('Обновляем устройства.');
@@ -481,11 +588,11 @@ class yadevices extends module
         $data = $this->apiRequest('https://iot.quasar.yandex.ru/m/v3/user/devices');
 		if($data == 'Unauthorized') return false;
 		if(!isset($data['status']) or $data['status'] != 'ok'){
-			$this->writeLog('Ошибка получения списка устройств', true);
+			$this->reportApiFailure('Ошибка получения списка устройств.');
 			return false;
 		}
 		if(!isset($data['households']) or !is_array($data['households'])){
-			$this->writeLog('Ответ Яндекс не содержит списка домов.', true);
+			$this->writeLog('Ответ Яндекс не содержит списка домов. ' . $this->api_last_error, true);
 			return false;
 		}
 		//Пройдемся по домам
@@ -1602,7 +1709,15 @@ EOD;
 
         $YaCurl = curl_init();
         curl_setopt($YaCurl, CURLOPT_URL, $url);
-		curl_setopt($YaCurl, CURLOPT_TIMEOUT, 5);
+		/* CURLOPT_TIMEOUT ограничивает ВСЮ операцию: DNS, TCP, TLS и передачу тела.
+		   Пяти секунд не хватало на список устройств (/m/v3/user/devices) — самый
+		   объёмный ответ облака, — и запрос обрывался по таймауту. Раздельные
+		   таймауты: недоступный хост по-прежнему отваливается быстро, а медленный
+		   ответ успевает дойти. */
+		curl_setopt($YaCurl, CURLOPT_CONNECTTIMEOUT, API_CONNECT_TIMEOUT);
+		curl_setopt($YaCurl, CURLOPT_TIMEOUT, API_TIMEOUT);
+		//Просим сжатие: список устройств в gzip передаётся в несколько раз быстрее
+		curl_setopt($YaCurl, CURLOPT_ENCODING, '');
         curl_setopt($YaCurl, CURLOPT_COOKIEFILE, YADEVICES_COOKIE_PATH);
         if ($method == 'GET') {
             curl_setopt($YaCurl, CURLOPT_POST, false);
@@ -1626,7 +1741,18 @@ EOD;
         curl_setopt($YaCurl, CURLOPT_SSL_VERIFYHOST, false);
         $result = curl_exec($YaCurl);
         $info = curl_getinfo($YaCurl);
+        $curl_errno = curl_errno($YaCurl);
+        $curl_error = curl_error($YaCurl);
         curl_close($YaCurl);
+        /* Раньше ошибка транспорта терялась целиком: curl_exec() возвращал false,
+           json_decode(false) давал null, и вызывающий код писал в журнал
+           «Ошибка получения списка устройств» без единой подробности.
+           Сохраняем всё, что нужно для разбора. */
+        $this->api_last_error = 'HTTP ' . ($info['http_code'] ?? 0)
+            . ', ' . round((float)($info['total_time'] ?? 0), 2) . ' c'
+            . ($curl_errno ? ', curl #' . $curl_errno . ': ' . $curl_error : '')
+            . ', URL ' . preg_replace('#^https?://#', '', $url)
+            . (is_string($result) && $result !== '' ? ', ответ: ' . mb_strcut(preg_replace('/\s+/u', ' ', $result), 0, 200) : ', ответ пуст');
 		if(($info['http_code'] ?? 0) == 401){
 			$this->getConfig();
 			if(!empty($this->config['AUTHORIZED'])){
@@ -1638,7 +1764,10 @@ EOD;
 						@unlink(YADEVICES_COOKIE_PATH.'_back');
 						$this->writeLog('Ошибка автоматической авторизации из бэкапа, необходима ручная авторизация', true);
 					} else {
-						$this->writeLog('Автоматическая авторизация из бэкапа успешна!', true);
+						/* Это сообщение об УСПЕХЕ: модуль сам восстановил авторизацию из
+						   резервной копии cookie. С флагом true оно попадало в
+						   «Ошибки системы» и выглядело там как сбой. */
+						$this->writeLog('Автоматическая авторизация из бэкапа успешна!', false);
 						return $this->apiRequest($url, $method, $params, $repeating);
 					}
 				}
@@ -1956,7 +2085,19 @@ function writeLog($message, $is_error = false){
 	if ($monitor != 1) return;
 	if ($is_error && $monitorType == 1) {
 		$trace = debug_backtrace();
-		$caller = $trace[1] ?? array('function' => 'unknown');
+		/* Код ошибки — имя функции, где отказ произошёл. Собственные обёртки
+		   журналирования пропускаем: иначе в «Ошибках системы» появляется
+		   бессмысленный код вида «YaDevice -> reportApiFailure», а история
+		   одной и той же операции разбивается на две записи. */
+		$own = array('writelog', 'reportapifailure');
+		$caller = array('function' => 'unknown');
+		$total = count($trace);
+		for ($i = 1; $i < $total; $i++) {
+			if (empty($trace[$i]['function'])) continue;
+			if (in_array(strtolower($trace[$i]['function']), $own)) continue;
+			$caller = $trace[$i];
+			break;
+		}
 		registerError("YaDevice -> {$caller['function']}", $message);
 	} else if ($monitorType == 2) {
 		debmes($message, 'yadevices');

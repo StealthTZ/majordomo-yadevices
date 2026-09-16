@@ -151,7 +151,8 @@ while(true) {
 			if(isset($station['CONNECT']) and is_resource($station['CONNECT']->getSocket()) and ($station['LAST_MESSAGE'] ?? 0) > time()-90){
 				$ar_read[] = $station['CONNECT']->getSocket();
 			} else {
-				$stations[$key]['IS_CONNECT'] = time();
+				quasarDiagnosticStart($stations[$key]);
+$stations[$key]['IS_CONNECT'] = time();
 				unset($stations[$key]['CONNECT']);
 				logEvent('Соединение с ' . $station['TITLE'] . ' прервано (нет данных дольше 90 секунд). Попытка соединения.');
 			}
@@ -177,7 +178,8 @@ while(true) {
 						try{
 							$response = $station['CONNECT']->receive();
 						} catch(Throwable $e){
-							$stations[$key]['IS_CONNECT'] = time();
+							quasarDiagnosticStart($stations[$key]);
+$stations[$key]['IS_CONNECT'] = time();
 							unset($stations[$key]['CONNECT']);
 							logEvent('Соединение с ' . $station['TITLE'] . ' прервано при чтении: ' . $e->getMessage());
 							continue;
@@ -190,7 +192,8 @@ while(true) {
 								try {
 									$station['CONNECT']->send($response, 'pong');
 								} catch (Throwable $e) {
-									$stations[$key]['IS_CONNECT'] = time();
+									quasarDiagnosticStart($stations[$key]);
+$stations[$key]['IS_CONNECT'] = time();
 									unset($stations[$key]['CONNECT']);
 									logEvent('Quasar pong failed; exception=' . get_class($e), true);
 								}
@@ -201,7 +204,8 @@ while(true) {
 								$closeCode = $station['CONNECT']->getCloseStatus();
 								logEvent('Quasar close; code=' . $closeCode . '; reason_bytes=' . strlen($response),
 									!in_array($closeCode, array(1000, 1001), true));
-								$stations[$key]['IS_CONNECT'] = time();
+								quasarDiagnosticStart($stations[$key]);
+$stations[$key]['IS_CONNECT'] = time();
 								unset($stations[$key]['CONNECT']);
 								continue;
 							}
@@ -209,7 +213,8 @@ while(true) {
 							$response = json_decode($response, true);
 							$jsonError = json_last_error();
 							if(!is_array($response) || !isset($response['message'])){
-								$stations[$key]['IS_CONNECT'] = time();
+								quasarDiagnosticStart($stations[$key]);
+$stations[$key]['IS_CONNECT'] = time();
 								unset($stations[$key]['CONNECT']);
 								logEvent('Quasar invalid message; opcode=' . $opcode
 									. '; bytes=' . $responseBytes . '; json_error=' . $jsonError
@@ -223,7 +228,8 @@ while(true) {
 								try{
 									$station['CONNECT']->send($response, 'pong');
 								} catch(Throwable $e){
-									$stations[$key]['IS_CONNECT'] = time();
+									quasarDiagnosticStart($stations[$key]);
+$stations[$key]['IS_CONNECT'] = time();
 									unset($stations[$key]['CONNECT']);
 									logEvent('Соединение с ' . $station['TITLE'] . ' прервано при ответе pong: ' . $e->getMessage());
 									continue;
@@ -352,7 +358,8 @@ while(true) {
 						$stations[$station_id]['CONNECT']->send($message);
 					} catch (Throwable $e) {
 						logEvent('Ошибка отправки команды ' . $command . ' на ' . $stations[$station_id]['TITLE'] . ': ' . $e->getMessage(), true);
-						$stations[$station_id]['IS_CONNECT'] = time();
+						quasarDiagnosticStart($stations[$station_id]);
+$stations[$station_id]['IS_CONNECT'] = time();
 						unset($stations[$station_id]['CONNECT']);
 					}
 				}
@@ -390,6 +397,32 @@ while(true) {
 	}
 }
 
+// Quasar transport diagnostics: elapsed time starts at detected loss,
+// or at the first connection attempt after cycle startup. Never log tokens.
+function quasarDiagnosticStart(&$station)
+{
+    if (($station['TITLE'] ?? '') !== 'Quasar') return;
+    if (!isset($station['DIAG_CONNECT_SINCE'])) {
+        $station['DIAG_CONNECT_SINCE'] = hrtime(true);
+        $station['DIAG_CONNECT_ATTEMPTS'] = 0;
+    }
+}
+
+function quasarDiagnosticConnected(&$station)
+{
+    if (($station['TITLE'] ?? '') !== 'Quasar') return;
+    $seconds = isset($station['DIAG_CONNECT_SINCE'])
+        ? max(0, (hrtime(true) - $station['DIAG_CONNECT_SINCE']) / 1000000000) : 0;
+    $reconnected = !empty($station['DIAG_CONNECTED_BEFORE']);
+    logEvent('Quasar ' . ($reconnected ? 'reconnected' : 'connected')
+        . '; ' . ($reconnected ? 'detected_outage_seconds=' : 'startup_connect_seconds=')
+        . number_format($seconds, 3, '.', '')
+        . '; attempts=' . (int)($station['DIAG_CONNECT_ATTEMPTS'] ?? 0)
+        . '; transport=websocket');
+    $station['DIAG_CONNECTED_BEFORE'] = true;
+    unset($station['DIAG_CONNECT_SINCE'], $station['DIAG_CONNECT_ATTEMPTS']);
+}
+
 function connect($stations){
 	global $yadevices;
 	//Подключаемся к Станциям, у которых прописан локальный IP и получен токен
@@ -397,6 +430,10 @@ function connect($stations){
 		// Переменная переиспользуется в цикле: без сброса станция могла получить соединение соседней станции
 		unset($connect);
 		if($station['IS_CONNECT'] != 0 and $station['IS_CONNECT'] <= time()){
+            quasarDiagnosticStart($stations[$key]);
+            if (($station['TITLE'] ?? '') === 'Quasar') {
+                $stations[$key]['DIAG_CONNECT_ATTEMPTS']++;
+            }
 			if(!empty($station['IP']) and !empty($station['DEVICE_TOKEN'])){
 				if(!isset($station['CONNECTION_OFF'])){
 					echo date('H:i:s') . ' Устанавливаем соединение с '. $station['TITLE'];
@@ -458,6 +495,7 @@ function connect($stations){
 					$stations[$key]['CONNECT'] = $connect;
 					$stations[$key]['LAST_MESSAGE'] = time();
 					$stations[$key]['IS_CONNECT'] = 0;
+                    quasarDiagnosticConnected($stations[$key]);
 					if(!isset($station['CONNECTION_OFF'])){
 						echo '.....Успешно!'.PHP_EOL;
 					} else {

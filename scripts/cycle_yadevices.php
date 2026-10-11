@@ -8,6 +8,8 @@ include_once("./lib/threads.php");
 set_time_limit(0);
 
 const RECONNECT_TIME = 60;
+// Предельная пауза между попытками получить адрес облака при затяжном сбое
+const RECONNECT_MAX_TIME = 300;
 // Сколько секунд ждём ответ станции на отправленную команду и сколько таких команд помним
 const ANSWER_TTL = 120;
 const ANSWER_MAX = 20;
@@ -442,10 +444,13 @@ function connect($stations){
 					$url = $yadevices->refreshDevices();
 					if(!$url){
 						if(!isset($station['CONNECTION_OFF'])){
-							echo '.....URL не получен. Попытки подключения раз в '. RECONNECT_TIME .' секунд.'.PHP_EOL;
+							echo '.....URL не получен. Повторные попытки с паузой от '. RECONNECT_TIME .' до '. RECONNECT_MAX_TIME .' секунд.'.PHP_EOL;
 							$stations[$key]['CONNECTION_OFF'] = 1;
 						}
-						$stations[$key]['IS_CONNECT'] = time()+RECONNECT_TIME;
+						// При затяжном сбое облака пауза растёт: 1, 2, 3, 4, 5, 5… минут
+						$fails = (int)($station['URL_FAILS'] ?? 0) + 1;
+						$stations[$key]['URL_FAILS'] = $fails;
+						$stations[$key]['IS_CONNECT'] = time() + min(RECONNECT_TIME * $fails, RECONNECT_MAX_TIME);
 						continue;
 					}
 					$quazarConfig = new ClientConfig();
@@ -495,6 +500,7 @@ function connect($stations){
 					$stations[$key]['CONNECT'] = $connect;
 					$stations[$key]['LAST_MESSAGE'] = time();
 					$stations[$key]['IS_CONNECT'] = 0;
+					unset($stations[$key]['URL_FAILS']);
                     quasarDiagnosticConnected($stations[$key]);
 					if(!isset($station['CONNECTION_OFF'])){
 						echo '.....Успешно!'.PHP_EOL;

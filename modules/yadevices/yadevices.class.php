@@ -12,8 +12,8 @@ const GLAGOL_PORT = 1961;
  * Выводится в шапке панели модуля и в журнале фонового цикла,
  * чтобы установленную версию можно было определить, не сверяя файлы.
  */
-const YADEVICES_VERSION = '2dc25e7+php8fix.10';
-const YADEVICES_VERSION_DATE = '2026-09-09';
+const YADEVICES_VERSION = '2dc25e7+php8fix.11';
+const YADEVICES_VERSION_DATE = '2026-10-11';
 
 /*
  * Таймауты обращений к облаку Яндекс, в секундах.
@@ -529,12 +529,16 @@ class yadevices extends module
      * Первый отказ и затем один раз в NETWORK_REPORT_INTERVAL идут как ошибка,
      * промежуточные — как информационное сообщение. Если причина отказа
      * сменилась (другой код curl), сообщаем сразу.
-     * Ответ от облака с ошибкой в теле регистрируется всегда: это уже не связь.
+     * Ответ облака с кодом 5xx — сбой на стороне Яндекса, такое же внешнее
+     * обстоятельство: ограничиваем частоту так же, с отдельным признаком причины.
+     * Остальные ответы с ошибкой (4xx, ошибка в теле) регистрируются всегда.
      */
     function reportApiFailure($prefix)
     {
 		$message = $prefix . ' ' . $this->api_last_error;
-		if (strpos((string)$this->api_last_error, 'HTTP 0') !== 0) {
+		$error = (string)$this->api_last_error;
+		$server_failure = (bool)preg_match('/^HTTP 5\d\d,/', $error);
+		if (strpos($error, 'HTTP 0') !== 0 && !$server_failure) {
 			$this->writeLog($message, true);
 			return;
 		}
@@ -546,7 +550,9 @@ class yadevices extends module
 		   Остальные коды (TLS, сертификат, протокол) — уже другая проблема,
 		   о них сообщаем сразу. */
 		$no_link = array(6, 7, 28);
-		if (preg_match('/curl #(\d+)/', (string)$this->api_last_error, $m)) {
+		if ($server_failure) {
+			$signature = 'server-5xx';
+		} elseif (preg_match('/curl #(\d+)/', $error, $m)) {
 			$signature = in_array((int)$m[1], $no_link) ? 'no-link' : 'curl' . $m[1];
 		} else {
 			$signature = 'no-link';

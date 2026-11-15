@@ -7,39 +7,6 @@
 Define('YADEVICES_COOKIE_PATH', ROOT . "cms/yadevices/cookie.txt");
 const GLAGOL_PORT = 1961;
 
-/*
- * Версия модуля. Формат: <коммит upstream>+php8fix.<номер правки>
- * Выводится в шапке панели модуля и в журнале фонового цикла,
- * чтобы установленную версию можно было определить, не сверяя файлы.
- */
-const YADEVICES_VERSION = '2dc25e7+php8fix.11';
-const YADEVICES_VERSION_DATE = '2026-10-11';
-
-/*
- * Таймауты обращений к облаку Яндекс, в секундах.
- * CONNECT — только установка соединения (DNS, TCP, TLS): недоступный хост
- * должен отваливаться быстро. TIMEOUT — вся операция вместе с передачей тела.
- */
-const API_CONNECT_TIMEOUT = 5;
-const API_TIMEOUT = 15;
-
-/*
- * Минимальный интервал между автоматическими обновлениями списка устройств,
- * которые заказывает receiveQuasar(). Одного вызова refreshDevices() хватает,
- * чтобы добавить сразу все устройства и все умения, поэтому повторы в пределах
- * этого интервала бессмысленны.
- */
-const REFRESH_MIN_INTERVAL = 60;
-
-/*
- * Как часто повторяющийся отказ связи с облаком попадает в «Ошибки системы».
- * Потеря связи — состояние внешней среды, а не сбой модуля: на мобильном
- * подключении она нормальна и повторяется десятки раз за сутки. Первый отказ
- * и затем один раз в этот интервал записываются как ошибка, промежуточные —
- * как информационное сообщение. Смена причины отказа сбрасывает интервал.
- */
-const NETWORK_REPORT_INTERVAL = 900;
-
 spl_autoload_register(function ($class_name) {
     $path = DIR_MODULES . 'yadevices/' . $class_name . '.php';
     $path = str_replace('\\', '/', $path);
@@ -56,7 +23,6 @@ use \WSSC\Components\ClientConfig;
  * @author Wizard <sergejey@gmail.com>
  * @copyright http://majordomo.smartliving.ru/ (c)
  * @version 0.1 (wizard, 15:12:58 [Dec 31, 2019])
- * @version 2dc25e7+php8fix.6 - совместимость с PHP 8.2/8.4, см. CHANGELOG-yadevices.md
  */
 //
 //
@@ -77,17 +43,6 @@ class yadevices extends module
     public $bgcolor;
     public $textcolor;
     public $csrf_token;
-    /* Диагностика последнего обращения к API Яндекс: HTTP-код, ошибка curl,
-     * время запроса и начало ответа. Заполняется в apiRequest(), читается
-     * в сообщениях об ошибках, чтобы по журналу можно было понять причину. */
-    public $api_last_error = '';
-    /* Время последней попытки обновить список устройств — для ограничения
-     * частоты автообновлений из receiveQuasar(). */
-    public $last_refresh_time = 0;
-    /* Когда и о какой причине отказа связи последний раз сообщали
-     * в «Ошибки системы» — чтобы одинаковые записи не копились. */
-    public $last_network_report = 0;
-    public $last_network_signature = '';
 
     /**
      * yadevices
@@ -255,11 +210,12 @@ class yadevices extends module
 					$params['data'] = $params['data'].'^'.$params['volume'];
 				}
                 if ($params['command'] == 'setVolume') {
-					if(isset($params['volume'])){
-						$params['data'] = is_float($params['volume']) ? (float)$params['volume'] : (float)$params['volume'] * 0.1;
-					} else {
-						$params['data'] = (float)($params['data'] ?? 0) * 0.1;
-					}
+						//Через HTTP API всё приходит строкой, is_float() всегда false.
+						//Шкала 0..10; дробь с точкой <= 1 (0.5) считаем уже нормализованной 0..1
+						$raw = (string)($params['volume'] ?? $params['data']);
+						$vol = (float)str_replace(',', '.', $raw);
+						if (strpbrk($raw, '.,') === false || $vol > 1) $vol *= 0.1;
+						$params['data'] = max(0, min(1, $vol));
 				} else if($params['command'] == 'volumeUp' or $params['command'] == 'volumeDown'){
 					$params['data'] = $params['command'];
 				} else if (isset($params['say'])) { //для обратной совместимости
@@ -285,9 +241,6 @@ class yadevices extends module
     function admin(&$out)
     {
         $this->getConfig();
-		$out['MODULE_VERSION'] = YADEVICES_VERSION;
-		$out['MODULE_VERSION_DATE'] = YADEVICES_VERSION_DATE;
-		$out['PHP_VERSION'] = PHP_VERSION;
 		$out['API_USERNAME'] = $this->config['API_USERNAME'] ?? '';
 		$out['OAUTH_TOKEN'] = $this->config['OAUTH_TOKEN'] ?? '';
 		
@@ -415,27 +368,23 @@ class yadevices extends module
 					$rec_device = SQLSelectOne("SELECT * FROM yadevices WHERE IOT_ID = '" . dbSafe($device['id']) . "'");
 					if(empty($rec_device['ID'])){
 						//Если такого устройства нет, обновляем девайсы
-						$this->refreshDevicesThrottled();
+						$this->refreshDevices();
 						continue;
 					}
 					//добавим статус в массив для дальнейшей обработки
-					if (isset($device['state']) && $device['state'] == 'online') {
-						$currentStatus = 1;
-					} else {
-						$currentStatus = 0;
-					}
-					$onlineArray = [
-						'type' => 'devices',
-						'state' => [
-							'value' => $currentStatus,
-						],
-						'parameters' => [
-							'instance' => 'online',
-						],
-					];
-					$device["properties"][] = $onlineArray;
-					//Циклом пройдемся по всем умениям
-					if (isset($device["capabilities"]) and is_array($device["capabilities"])) {
+					//В update_states поле state приходит не всегда: без него статус online не трогаем
+						$currentStatus = '';
+						if (isset($device['state'])) {
+							$currentStatus = $device['state'] == 'online' ? 1 : 0;
+							$device["properties"][] = [
+								'type' => 'devices',
+								'state' => ['value' => $currentStatus],
+								'parameters' => ['instance' => 'online'],
+							];
+						}
+						
+						//Циклом пройдемся по всем умениям
+						if (isset($device["capabilities"]) and is_array($device["capabilities"])) {
 						foreach ($device["capabilities"] as $capabilitie) {
 							if ($capabilitie['type'] == 'devices.capabilities.quasar.server_action') {
 								$c_type = 'cloud.aswr_scenario';
@@ -452,11 +401,17 @@ class yadevices extends module
 							}
 							$req_skills = SQLSelectOne("SELECT * FROM yadevices_capabilities WHERE TITLE = '" . dbSafe($c_type) . "' AND YADEVICE_ID = " . (int)$rec_device['ID']);
 							if(empty($req_skills['ID'])) {
-								$this->refreshDevicesThrottled();
+								//Умения Станций в БД не хранятся: без ограничения полный опрос облака
+								//запускался бы на каждое событие от Станции. Не чаще раза в 5 минут.
+								static $lastCapsRefresh = 0;
+								if (time() - $lastCapsRefresh > 300) {
+									$lastCapsRefresh = time();
+									$this->refreshDevices();
+								}
 								continue;
 							}
 							//Основные умения, меняем значение
-							$value = '?';
+								$value = null;
 							if (isset($capabilitie['state']['value'])){
 								if(is_bool($capabilitie['state']['value']) == true) {
 									if ($capabilitie['state']['value'] == true) {
@@ -468,13 +423,17 @@ class yadevices extends module
 									$value = $this->flattenValue($capabilitie['state']['value']);
 								}  
 							}
-							//Ответы на сценарии обновляем всегда
+							//Нет значения в сообщении — нечего обновлять (раньше в свойство писался '?')
+								if ($value === null) continue;
+								//Ответы на сценарии обновляем всегда
 							if ($c_type == 'cloud.aswr_scenario' or $value != $req_skills['VALUE']) {
 								$params = array();
+								$station = SQLSelectOne("SELECT ID FROM yastations WHERE IOT_ID='" . DBSafe($device['id']) . "'");
 								$params['NEW_VALUE'] = $value;
-								$params['OLD_VALUE'] = $req_skills['VALUE'];
+								$params['OLD_VALUE'] = $req_skills['VALUE'] ?? '';
+								$params['STATION_ID'] = $station['ID'] ?? '';
 								$params['DEVICE_STATE'] = $currentStatus;
-								$params['ALLOWPARAMS'] = $req_skills['ALLOWPARAMS'];
+								$params['ALLOWPARAMS'] = $req_skills['ALLOWPARAMS'] ?? '';
 								$params['UPDATED'] = date('Y-m-d H:i:s');
 								$params['MODULE'] = $this->name;
 								$this->setProperty($req_skills, $value, $params, $c_type);
@@ -520,74 +479,8 @@ class yadevices extends module
 		}
 	}
 	
-    /*
-     * Сообщение об отказе обращения к облаку.
-     * Отсутствие ответа («HTTP 0») означает потерю связи: отказ DNS, нет
-     * маршрута, таймаут соединения. Это внешнее обстоятельство, и записывать
-     * его в «Ошибки системы» на каждой попытке смысла нет — за ночь набегают
-     * десятки одинаковых строк, среди которых теряются настоящие ошибки.
-     * Первый отказ и затем один раз в NETWORK_REPORT_INTERVAL идут как ошибка,
-     * промежуточные — как информационное сообщение. Если причина отказа
-     * сменилась (другой код curl), сообщаем сразу.
-     * Ответ облака с кодом 5xx — сбой на стороне Яндекса, такое же внешнее
-     * обстоятельство: ограничиваем частоту так же, с отдельным признаком причины.
-     * Остальные ответы с ошибкой (4xx, ошибка в теле) регистрируются всегда.
-     */
-    function reportApiFailure($prefix)
-    {
-		$message = $prefix . ' ' . $this->api_last_error;
-		$error = (string)$this->api_last_error;
-		$server_failure = (bool)preg_match('/^HTTP 5\d\d,/', $error);
-		if (strpos($error, 'HTTP 0') !== 0 && !$server_failure) {
-			$this->writeLog($message, true);
-			return;
-		}
-		/* Признак причины должен быть грубым. На мобильном подключении код curl
-		   произвольно чередуется между 6 (имя не разрешилось), 7 (соединиться
-		   не удалось) и 28 (таймаут) — это одно и то же обстоятельство «связи нет».
-		   Различая их, ограничение частоты не работало вовсе: каждая попытка
-		   выглядела новой причиной и попадала в «Ошибки системы».
-		   Остальные коды (TLS, сертификат, протокол) — уже другая проблема,
-		   о них сообщаем сразу. */
-		$no_link = array(6, 7, 28);
-		if ($server_failure) {
-			$signature = 'server-5xx';
-		} elseif (preg_match('/curl #(\d+)/', $error, $m)) {
-			$signature = in_array((int)$m[1], $no_link) ? 'no-link' : 'curl' . $m[1];
-		} else {
-			$signature = 'no-link';
-		}
-		if ($signature === $this->last_network_signature
-			&& (time() - (int)$this->last_network_report) < NETWORK_REPORT_INTERVAL) {
-			$this->writeLog($message);
-			return;
-		}
-		$this->last_network_signature = $signature;
-		$this->last_network_report = time();
-		$this->writeLog($message, true);
-    }
-
-    /*
-     * Обновление списка устройств с ограничением частоты.
-     * receiveQuasar() заказывает обновление внутри двух вложенных циклов:
-     * для каждого незнакомого устройства и для каждого незнакомого умения.
-     * Одно сообщение от облака про устройство с шестью новыми умениями давало
-     * шесть полных запросов всего списка домов подряд, хотя список умений
-     * заполняется целиком уже первым из них. При недоступной сети каждый такой
-     * запрос — это ожидание до API_CONNECT_TIMEOUT и отдельная запись
-     * в «Ошибках системы».
-     */
-    function refreshDevicesThrottled()
-    {
-		if ((time() - (int)$this->last_refresh_time) < REFRESH_MIN_INTERVAL) {
-			return false;
-		}
-		return $this->refreshDevices();
-    }
-
     function refreshDevices()
     {
-		$this->last_refresh_time = time();
 		$this->getConfig();
 		if(empty($this->config['AUTHORIZED'])) return false;
 		$this->writeLog('Обновляем устройства.');
@@ -595,11 +488,11 @@ class yadevices extends module
         $data = $this->apiRequest('https://iot.quasar.yandex.ru/m/v3/user/devices');
 		if($data == 'Unauthorized') return false;
 		if(!isset($data['status']) or $data['status'] != 'ok'){
-			$this->reportApiFailure('Ошибка получения списка устройств.');
+			$this->writeLog('Ошибка получения списка устройств', true);
 			return false;
 		}
 		if(!isset($data['households']) or !is_array($data['households'])){
-			$this->writeLog('Ответ Яндекс не содержит списка домов. ' . $this->api_last_error, true);
+			$this->writeLog('Ответ Яндекс не содержит списка домов.', true);
 			return false;
 		}
 		//Пройдемся по домам
@@ -712,7 +605,8 @@ class yadevices extends module
 					//Циклом пройдемся по всем умениям
 					if(isset($device["capabilities"]) and is_array($device["capabilities"])) {
 						foreach($device["capabilities"] as $capabilitie) {
-							if($capabilitie['type'] == 'devices.capabilities.on_off') {
+								$value = null; //иначе значение «протекает» из предыдущего умения
+								if($capabilitie['type'] == 'devices.capabilities.on_off') {
 								$c_type = $capabilitie['type'];
 							} else {
 								if(isset($capabilitie['state']['instance']) && $capabilitie['state']['instance']) {
@@ -747,6 +641,10 @@ class yadevices extends module
 							if($allowparam !== '') {
 								$c_rec['ALLOWPARAMS'] = $allowparam;
 							}
+							//Изменения, пришедшие при полном опросе (старт цикла, переподключение), тоже передаем в привязки
+							if (!empty($c_rec['ID']) && (string)$c_rec['VALUE'] !== (string)$value) {
+								$this->setProperty($c_rec, $value, ['NEW_VALUE' => $value, 'OLD_VALUE' => $c_rec['VALUE'], 'UPDATED' => date('Y-m-d H:i:s'), 'MODULE' => $this->name], $c_type);
+							}
 							$c_rec['VALUE'] = $value;
 							$c_rec['YADEVICE_ID'] = $device_rec['ID'];
 							$c_rec['TITLE'] = $c_type;
@@ -761,8 +659,9 @@ class yadevices extends module
 							}
 						}
 					}
-					//Значения датчиков
-					if(isset($device["properties"]) and is_array($device["properties"])) {
+					//Значения датчиков (+ статус online, в т.ч. для устройств без датчиков: лампы, розетки)
+						if(!isset($device["properties"]) || !is_array($device["properties"])) $device["properties"] = [];
+						if(isset($device["properties"]) and is_array($device["properties"])) {
 						//Запихнем еще наш статус в массив
 						$onlineArray = [
 							'type' => 'devices.online',
@@ -781,6 +680,9 @@ class yadevices extends module
 				
 							//Запросим из БД текущие значения
 							$p_rec = SQLSelectOne("SELECT * FROM yadevices_capabilities WHERE YADEVICE_ID=" . (int)$device_rec['ID'] . " AND TITLE='" . DBSafe($p_type) . "'");
+							if (!empty($p_rec['ID']) && (string)$p_rec['VALUE'] !== (string)$value) {
+								$this->setProperty($p_rec, $value, ['NEW_VALUE' => $value, 'OLD_VALUE' => $p_rec['VALUE'], 'UPDATED' => date('Y-m-d H:i:s'), 'MODULE' => $this->name], $p_type);
+							}
 							$p_rec['VALUE'] = $value;
 							$p_rec['UPDATED'] = date('Y-m-d H:i:s');
 							$p_rec['YADEVICE_ID'] = $device_rec['ID'];
@@ -798,12 +700,18 @@ class yadevices extends module
 				}
 			}
 		}
+        //Защита от массового удаления (и отвязки свойств) при пустом/неполном ответе
+		if (empty($iot_ids)) {
+			$this->writeLog('Яндекс вернул пустой список устройств, удаление пропущено.', true);
+			$this->addScenarios();
+			return $data['updates_url'] ?? false;
+		}
         $all_devices = SQLSelect("SELECT ID, IOT_ID, TITLE FROM yadevices WHERE IOT_ID!=''");
 		//dprint($all_devices);
         $total = count($all_devices);
         for ($i = 0; $i < $total; $i++) {
             if (!in_array($all_devices[$i]['IOT_ID'], $iot_ids)) {
-				$this->writeLog('Устройство'.$all_devices[$i]['TITLE'].' удалено.');
+				$this->writeLog('Устройство '.$all_devices[$i]['TITLE'].' удалено.', true);
                 $this->delete_yadevice($all_devices[$i]['ID']);
             }
         }
@@ -1001,7 +909,7 @@ class yadevices extends module
             foreach ($items as $item) {
 				//Исключаем приложения на телефоне и ТВ
 				$itemPlatform = $item['platform'] ?? '';
-				if($itemPlatform == 'alice_app_ios' or $itemPlatform == 'iot_app_ios' or $itemPlatform == 'iot_app_android' or $itemPlatform == 'yandex_tv_mt6681_cv') continue;
+				if($itemPlatform == 'alice_app_ios' or $itemPlatform == 'iot_app_ios' or $itemPlatform == 'iot_app_android' or $itemPlatform == 'yandex_tv_mt6681_cv' or $itemPlatform == 'navi_maps_ios' or $itemPlatform == 'navi_maps') continue;
 				if(empty($item['id'])) continue;
                 $rec = SQLSelectOne("SELECT * FROM yastations WHERE STATION_ID='" . DBSafe($item['id']) . "'");
                 if (empty($rec['ID'])) continue;
@@ -1374,7 +1282,7 @@ class yadevices extends module
 			$station = SQLSelectOne("SELECT * FROM yastations WHERE IOT_ID='" . DBSafe($station) . "'");
 		}
         if (empty($station['ID']) || empty($station['IP'])) return false;
-        if (isset($station['DEVICE_TOKEN'])) {
+        if (!empty($station['DEVICE_TOKEN'])) {
 			$updatedCycle = gg('cycle_yadevicesRun');
 			if ((time() - (int)$updatedCycle < 16)) {
 				if($data != '') $data = '^' . $data;
@@ -1444,7 +1352,7 @@ class yadevices extends module
             $message = $details['message'] ?? '';
 
             // TTS LOCAL & CLOUD
-            $qry = "TTS=1 OR TTS=2 AND IOT_ID!=''";
+            $qry = "(TTS=1 OR (TTS=2 AND IOT_ID!=''))";
             if (!empty($details['destination'])) {
                 $qry .= " AND yastations.TITLE LIKE '%" . DBSafe($details['destination']) . "%'";
             }
@@ -1457,7 +1365,15 @@ class yadevices extends module
                 if ($level >= $min_level) {
                     //$this->sendCloudTTS($station['IOT_ID'],$message);
 					//$this->sendCommandToStation($station, 'text', $message);
-                    callAPI('/api/module/yadevices', 'GET', array('station' => $station['ID'], 'command' => 'text', 'data' => $message));
+                    if ((int)$station['TTS'] == 1 && !empty($station['DEVICE_TOKEN']) && !empty($station['IP'])
+                        && time() - (int)gg('cycle_yadevicesRun') < 16) {
+                        // Локальная Станция при работающем цикле: фраза сразу в очередь операций.
+                        // callAPI() в режиме «отправил и забыл» обрабатывает несколько say() подряд
+                        // параллельно, и фразы могут попасть в очередь не в том порядке
+                        $this->sendCommandToStation($station, 'text', $message);
+                    } else {
+                        callAPI('/api/module/yadevices', 'GET', array('station' => $station['ID'], 'command' => 'text', 'data' => $message));
+                    }
                 }
             }
         }
@@ -1710,21 +1626,13 @@ EOD;
     {
         $debug = 0;
 
-        if ($method != 'GET' && !isset($this->csrf_token)) {
-            $token = $this->getToken();
+        if ($method != 'GET' && empty($this->csrf_token)) {
+            $this->getToken();
         }
 
         $YaCurl = curl_init();
         curl_setopt($YaCurl, CURLOPT_URL, $url);
-		/* CURLOPT_TIMEOUT ограничивает ВСЮ операцию: DNS, TCP, TLS и передачу тела.
-		   Пяти секунд не хватало на список устройств (/m/v3/user/devices) — самый
-		   объёмный ответ облака, — и запрос обрывался по таймауту. Раздельные
-		   таймауты: недоступный хост по-прежнему отваливается быстро, а медленный
-		   ответ успевает дойти. */
-		curl_setopt($YaCurl, CURLOPT_CONNECTTIMEOUT, API_CONNECT_TIMEOUT);
-		curl_setopt($YaCurl, CURLOPT_TIMEOUT, API_TIMEOUT);
-		//Просим сжатие: список устройств в gzip передаётся в несколько раз быстрее
-		curl_setopt($YaCurl, CURLOPT_ENCODING, '');
+		curl_setopt($YaCurl, CURLOPT_TIMEOUT, 5);
         curl_setopt($YaCurl, CURLOPT_COOKIEFILE, YADEVICES_COOKIE_PATH);
         if ($method == 'GET') {
             curl_setopt($YaCurl, CURLOPT_POST, false);
@@ -1748,45 +1656,35 @@ EOD;
         curl_setopt($YaCurl, CURLOPT_SSL_VERIFYHOST, false);
         $result = curl_exec($YaCurl);
         $info = curl_getinfo($YaCurl);
-        $curl_errno = curl_errno($YaCurl);
-        $curl_error = curl_error($YaCurl);
         curl_close($YaCurl);
-        /* Раньше ошибка транспорта терялась целиком: curl_exec() возвращал false,
-           json_decode(false) давал null, и вызывающий код писал в журнал
-           «Ошибка получения списка устройств» без единой подробности.
-           Сохраняем всё, что нужно для разбора. */
-        $this->api_last_error = 'HTTP ' . ($info['http_code'] ?? 0)
-            . ', ' . round((float)($info['total_time'] ?? 0), 2) . ' c'
-            . ($curl_errno ? ', curl #' . $curl_errno . ': ' . $curl_error : '')
-            . ', URL ' . preg_replace('#^https?://#', '', $url)
-            . (is_string($result) && $result !== '' ? ', ответ: ' . mb_strcut(preg_replace('/\s+/u', ' ', $result), 0, 200) : ', ответ пуст');
 		if(($info['http_code'] ?? 0) == 401){
-			$this->getConfig();
-			if(!empty($this->config['AUTHORIZED'])){
-				if(file_exists(YADEVICES_COOKIE_PATH.'_back')){
+				$this->getConfig();
+				$wasAuthorized = !empty($this->config['AUTHORIZED']);
+				//Сначала фиксируем потерю авторизации: защита от бесконечной рекурсии
+				//(бэкап тоже протух) и от петли say() -> SAY -> облачный TTS -> 401 -> say()
+				$this->config['AUTHORIZED'] = 0;
+				$this->saveConfig();
+				if($wasAuthorized && !$repeating && file_exists(YADEVICES_COOKIE_PATH.'_back')){
 					copy(YADEVICES_COOKIE_PATH.'_back', YADEVICES_COOKIE_PATH);
-					$checkCookie = $this->apiRequest('https://iot.quasar.yandex.ru/m/user/scenarios');
-					if (!is_array($checkCookie) || ($checkCookie['status'] ?? '') != 'ok') {
-						@unlink(YADEVICES_COOKIE_PATH);
-						@unlink(YADEVICES_COOKIE_PATH.'_back');
-						$this->writeLog('Ошибка автоматической авторизации из бэкапа, необходима ручная авторизация', true);
-					} else {
-						/* Это сообщение об УСПЕХЕ: модуль сам восстановил авторизацию из
-						   резервной копии cookie. С флагом true оно попадало в
-						   «Ошибки системы» и выглядело там как сбой. */
-						$this->writeLog('Автоматическая авторизация из бэкапа успешна!', false);
-						return $this->apiRequest($url, $method, $params, $repeating);
+					$checkCookie = $this->apiRequest('https://iot.quasar.yandex.ru/m/user/scenarios', 'GET', 0, 1);
+					if (is_array($checkCookie) && ($checkCookie['status'] ?? '') == 'ok') {
+						$this->config['AUTHORIZED'] = 1;
+						$this->saveConfig();
+						$this->writeLog('Автоматическая авторизация из бэкапа успешна!', true);
+						return $this->apiRequest($url, $method, $params, 1);
+					}
+					@unlink(YADEVICES_COOKIE_PATH);
+					@unlink(YADEVICES_COOKIE_PATH.'_back');
+					$this->writeLog('Ошибка автоматической авторизации из бэкапа, необходима ручная авторизация', true);
+				}
+				if($wasAuthorized){
+					say("В модуле Yadevices отсутствует авторизация", gg('ThisComputer.minMsgLevel'));
+					if(method_exists($this, 'sendnotification')) {
+						$this->sendnotification('Авторизация отсутствует', 'warning');
 					}
 				}
-				say("В модуле Yadevices отсутствует авторизация", gg('ThisComputer.minMsgLevel'));
-				if(method_exists($this, 'sendnotification')) {
-					$this->sendnotification('Авторизация отсутствует', 'warning ');
-				}
+				return 'Unauthorized';
 			}
-			$this->config['AUTHORIZED'] = 0;
-			$this->saveConfig();
-			return 'Unauthorized';
-		}
         $request_headers = $info['request_header'] ?? '';
         if ($debug) {
             dprint("REQUEST HEADERS:",false);
@@ -1800,7 +1698,7 @@ EOD;
         }
         if (!$repeating &&
             (!isset($data['code']) || $data['code']!= 'BAD_REQUEST') &&   
-            ($result_code==403 || (isset($data['status']) && $data['status'] == 'error'))
+            ($result_code==403 || ($method == 'GET' && isset($data['status']) && $data['status'] == 'error'))
         ) {
             if ($debug) {
                 dprint("REPEATING: ".$method." ".$url,false);
@@ -2092,19 +1990,7 @@ function writeLog($message, $is_error = false){
 	if ($monitor != 1) return;
 	if ($is_error && $monitorType == 1) {
 		$trace = debug_backtrace();
-		/* Код ошибки — имя функции, где отказ произошёл. Собственные обёртки
-		   журналирования пропускаем: иначе в «Ошибках системы» появляется
-		   бессмысленный код вида «YaDevice -> reportApiFailure», а история
-		   одной и той же операции разбивается на две записи. */
-		$own = array('writelog', 'reportapifailure');
-		$caller = array('function' => 'unknown');
-		$total = count($trace);
-		for ($i = 1; $i < $total; $i++) {
-			if (empty($trace[$i]['function'])) continue;
-			if (in_array(strtolower($trace[$i]['function']), $own)) continue;
-			$caller = $trace[$i];
-			break;
-		}
+		$caller = $trace[1] ?? array('function' => 'unknown');
 		registerError("YaDevice -> {$caller['function']}", $message);
 	} else if ($monitorType == 2) {
 		debmes($message, 'yadevices');

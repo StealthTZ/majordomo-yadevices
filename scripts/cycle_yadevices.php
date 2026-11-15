@@ -8,11 +8,12 @@ include_once("./lib/threads.php");
 set_time_limit(0);
 
 const RECONNECT_TIME = 60;
-// Предельная пауза между попытками получить адрес облака при затяжном сбое
-const RECONNECT_MAX_TIME = 300;
-// Сколько секунд ждём ответ станции на отправленную команду и сколько таких команд помним
-const ANSWER_TTL = 120;
-const ANSWER_MAX = 20;
+// Очередь голосовых фраз (команда text): станция обрывает текущую речь новой командой,
+// поэтому следующая фраза уходит только после того, как предыдущая договорена
+const TTS_START_WAIT = 4;   // сек ждём начала речи, иначе считаем фразу завершённой
+const TTS_MAX_WAIT = 60;    // сек предельное ожидание одной фразы
+const TTS_QUEUE_TTL = 120;  // сек жизни фразы в очереди
+const TTS_QUEUE_MAX = 20;   // максимум фраз в очереди станции
 
 include_once("./load_settings.php");
 include_once(DIR_MODULES . "control_modules/control_modules.class.php");
@@ -30,91 +31,12 @@ $ctl = new control_modules();
 include_once(DIR_MODULES . 'yadevices/yadevices.class.php');
 $yadevices = new yadevices();
 
-/* ------------------------------------------------------------------
- * Диагностика работы цикла.
- *
- * Вывод через echo уходит в /dev/null, если в config.php не включён
- * LOG_CYCLES, поэтому все значимые события дублируются в DebMes:
- * он пишет всегда, в cms/debmes/<дата>/.
- *
- * Причина остановки записывается в cycle_yadevicesLastError — именно это
- * поле диспетчер cycle.php подставляет в сообщение «Цикл остановлен».
- * Без него сообщение содержит только код сигнала и ничего о причине.
- * ------------------------------------------------------------------ */
-const CYCLE_NAME = 'cycle_yadevices';
-
-function logEvent($message, $is_error = false)
-{
-	$line = date('H:i:s') . ' ' . $message;
-	echo $line . PHP_EOL;                       // виден при LOG_CYCLES=1
-	DebMes($message, $is_error ? 'yadevices_error' : 'yadevices');
-}
-
-function saveStopReason($reason)
-{
-	// Значение колонки ограничено 255 символами
-	if (!function_exists('saveCycleToCache')) return;
-	// saveCycleToCache() сверяет длину через strlen(), то есть в БАЙТАХ, и при
-	// превышении 255 не обрезает значение, а удаляет запись. Кириллица занимает
-	// два байта на символ, поэтому режем mb_strcut'ом по байтам, не разрывая символ.
-	$reason = mb_strcut(preg_replace('/\s+/u', ' ', (string)$reason), 0, 240);
-	@saveCycleToCache(CYCLE_NAME . 'LastError', $reason);
-}
-
-function saveCycleState($stations)
-{
-	if (!function_exists('saveCycleToCache')) return;
-	$connected = 0;
-	$pending = 0;
-	if (is_array($stations)) {
-		foreach ($stations as $st) {
-			if (isset($st['CONNECT'])) $connected++;
-			if (isset($st['ANSWER']) && is_array($st['ANSWER'])) $pending += count($st['ANSWER']);
-		}
-	}
-	// Снимок пишется раз в минуту. После убийства процесса сигналом (его перехватить нельзя)
-	// последний снимок показывает, сколько памяти цикл занимал перед смертью.
-	@saveCycleToCache(CYCLE_NAME . 'State', mb_strcut(sprintf(
-		'%s память %.1f МБ (пик %.1f МБ), станций %d, подключено %d, ждут ответа %d',
-		date('H:i:s'),
-		memory_get_usage(true) / 1048576,
-		memory_get_peak_usage(true) / 1048576,
-		is_array($stations) ? count($stations) : 0,
-		$connected,
-		$pending
-	), 0, 240));
-}
-
-set_exception_handler(function (Throwable $e) {
-	$msg = 'Необработанное исключение: ' . get_class($e) . ': ' . $e->getMessage()
-		. ' (' . basename($e->getFile()) . ':' . $e->getLine() . ')';
-	saveStopReason($msg);
-	logEvent($msg, true);
-});
-
-register_shutdown_function(function () {
-	$err = error_get_last();
-	if ($err !== null && in_array($err['type'], array(E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR), true)) {
-		$msg = 'Фатальная ошибка: ' . $err['message'] . ' (' . basename($err['file']) . ':' . $err['line'] . ')'
-			. ' Память: ' . round(memory_get_usage(true) / 1048576, 1) . ' МБ';
-		saveStopReason($msg);
-		DebMes($msg, 'yadevices_error');
-	}
-});
-
 $latest_check_cycle = 0;
-$latest_state_saved = 0;
 $latest_check = 0;
 $sendPlayerState = false;
 $volRefresh = '';
-$num_changed_streams = 0;
-// Массив должен существовать до первого обращения: без авторизации и без станций в БД он остаётся пустым
-$stations = array();
 
-// Причина прошлой остановки уже показана диспетчером, очищаем перед новым запуском
-saveStopReason('');
-logEvent('Запуск ' . basename(__FILE__) . ': модуль ' . YADEVICES_VERSION . ' от ' . YADEVICES_VERSION_DATE
-	. ', PHP ' . PHP_VERSION . ', memory_limit ' . ini_get('memory_limit') . ', PID ' . getmypid());
+echo date("H:i:s") . " запуск " . basename(__FILE__) . PHP_EOL;
 
 //Конфиг
 $yadevices->getConfig();
@@ -127,7 +49,7 @@ if(!empty($yadevices->config['AUTHORIZED'])){
 	$quasar['ANSWER'] = '';
 	$stations[] = $quasar;
 } else {
-	logEvent('Авторизация отсутствует, подключение к облаку не производится.', true);
+	echo date("H:i:s") . " Авторизация отсутствует! Подключение к облаку не производится." . PHP_EOL;
 }
 
 //Сделаем массив с ключамм в виде IOT_ID
@@ -139,8 +61,7 @@ foreach($stations_temp as $station){
 	$stations[$station['IOT_ID']]['ANSWER'] = '';
 }
 unset($stations_temp);
-$reloadTime = (int)($yadevices->config['RELOAD_TIME'] ?? 10);
-if ($reloadTime < 5) $reloadTime = 10;
+$reloadTime = $yadevices->config['RELOAD_TIME'] ?? 10;
 
 while(true) {
 	$stations = connect($stations);
@@ -150,23 +71,22 @@ while(true) {
 	foreach($stations as $key => $station){
 		if($station['IS_CONNECT'] == 0){
 			//Если соединение не ресурс или последнее сообщение было больше 1.5 минут назад, соединение потеряно
-			if(isset($station['CONNECT']) and is_resource($station['CONNECT']->getSocket()) and ($station['LAST_MESSAGE'] ?? 0) > time()-90){
+			if(is_resource($station['CONNECT']->getSocket()) and $station['LAST_MESSAGE'] > time()-90){
 				$ar_read[] = $station['CONNECT']->getSocket();
 			} else {
-				quasarDiagnosticStart($stations[$key]);
-$stations[$key]['IS_CONNECT'] = time();
+				$stations[$key]['IS_CONNECT'] = time();
 				unset($stations[$key]['CONNECT']);
-				logEvent('Соединение с ' . $station['TITLE'] . ' прервано (нет данных дольше 90 секунд). Попытка соединения.');
+				echo date('H:i:s') . ' Соединение с '. $station['TITLE'] . ' прервано. Попытка соединения.' . PHP_EOL;
 			}
 		}
 	}
 	if(!empty($ar_read)){
 		try{
 			if (($num_changed_streams = stream_select($ar_read, $ar_write, $ar_ex, 0, 200000)) === false) {
-				logEvent('Ошибка stream_select(), сокетов в наборе: ' . count($ar_read), true);
+				echo date('H:i:s') . ' Error stream_select()' . PHP_EOL;
 			}
 		} catch (Throwable $e) {
-			logEvent('Исключение в stream_select(): ' . $e->getMessage(), true);
+			var_dump($e->getMessage());
 		} 
 		//нечего читать, просто ждём
 	} else {
@@ -179,127 +99,101 @@ $stations[$key]['IS_CONNECT'] = time();
 					if(isset($station['CONNECT']) and $socket == $station['CONNECT']->getSocket()){
 						try{
 							$response = $station['CONNECT']->receive();
-						} catch(Throwable $e){
-							quasarDiagnosticStart($stations[$key]);
-$stations[$key]['IS_CONNECT'] = time();
+						} catch(Exception $e){
+							$stations[$key]['IS_CONNECT'] = time();
 							unset($stations[$key]['CONNECT']);
-							logEvent('Соединение с ' . $station['TITLE'] . ' прервано при чтении: ' . $e->getMessage());
+							echo date('H:i:s') . ' Соединение с '. $station['TITLE'] . ' прервано.' . PHP_EOL;
 							continue;
 						}
 						$stations[$key]['LAST_MESSAGE'] = time();
 						if($station['TITLE'] == "Quasar"){
-							// Control frames are not JSON application messages.
-							$opcode = $station['CONNECT']->getLastOpcode();
-							if ($opcode === 'ping') {
-								try {
-									$station['CONNECT']->send($response, 'pong');
-								} catch (Throwable $e) {
-									quasarDiagnosticStart($stations[$key]);
-$stations[$key]['IS_CONNECT'] = time();
-									unset($stations[$key]['CONNECT']);
-									logEvent('Quasar pong failed; exception=' . get_class($e), true);
-								}
-								continue;
-							}
-							if ($opcode === 'pong') continue;
-							if ($opcode === 'close') {
-								$closeCode = $station['CONNECT']->getCloseStatus();
-								logEvent('Quasar close; code=' . $closeCode . '; reason_bytes=' . strlen($response),
-									!in_array($closeCode, array(1000, 1001), true));
-								quasarDiagnosticStart($stations[$key]);
-$stations[$key]['IS_CONNECT'] = time();
-								unset($stations[$key]['CONNECT']);
-								continue;
-							}
-							$responseBytes = strlen($response);
 							$response = json_decode($response, true);
-							$jsonError = json_last_error();
-							if(!is_array($response) || !isset($response['message'])){
-								quasarDiagnosticStart($stations[$key]);
-$stations[$key]['IS_CONNECT'] = time();
+							if(!isset($response['message'])){
+								print_r($response);
+								$stations[$key]['IS_CONNECT'] = time();
 								unset($stations[$key]['CONNECT']);
-								logEvent('Quasar invalid message; opcode=' . $opcode
-									. '; bytes=' . $responseBytes . '; json_error=' . $jsonError
-									. '; decoded_type=' . gettype($response) . '; reconnect=1', true);
+								echo date('H:i:s') . ' Соединение с '. $station['TITLE'] . ' прервано.' . PHP_EOL;
 								continue;
 							}
-							if(($response['operation'] ?? '') == 'update_states')
+							$message = json_decode($response['message'], true);
+							if($response['operation'] == 'update_states')
 								$yadevices->receiveQuasar($response);
 						} else {
 							if($station['CONNECT']->getLastOpcode() == 'ping'){
 								try{
 									$station['CONNECT']->send($response, 'pong');
-								} catch(Throwable $e){
-									quasarDiagnosticStart($stations[$key]);
-$stations[$key]['IS_CONNECT'] = time();
+								} catch(Exception $e){
+									$stations[$key]['IS_CONNECT'] = time();
 									unset($stations[$key]['CONNECT']);
-									logEvent('Соединение с ' . $station['TITLE'] . ' прервано при ответе pong: ' . $e->getMessage());
+									echo date('H:i:s') . ' Соединение с '. $station['TITLE'] . ' прервано.' . PHP_EOL;
 									continue;
 								}
 							} else {
 								$response_arr = json_decode($response, true);
 								//if($station['TITLE'] == "Яндекс Станция") print_r($response_arr);
 								if(!isset($response_arr['state'])) {
-									logEvent('Неожиданное сообщение от ' . $station['TITLE'] . ': ' . mb_substr((string)$response, 0, 200));
+									echo date('H:i:s') . ' Неожиданное сообщение от ' . $station['TITLE'] . ": " . $response . PHP_EOL;
 									continue;
 								}
 								if(isset($response_arr['requestId'])){
 									if(isset($station['ANSWER'][$response_arr['requestId']])) {
-										if(($response_arr['status'] ?? '') != "SUCCESS"){
-											logEvent('Станция ' . $station['TITLE'] . ' отклонила команду '
-												. $station['ANSWER'][$response_arr['requestId']]['command'] . ': '
-												. $station['ANSWER'][$response_arr['requestId']]['value'] . ' - ' . $response_arr['status'], true);
+										if($response_arr['status'] != "SUCCESS"){
+											echo date('H:i:s') . ' Ошибка выполнения команды '. $station['ANSWER'][$response_arr['requestId']]['command'].': '.$station['ANSWER'][$response_arr['requestId']]['value'].' - '.$response_arr['status'] . PHP_EOL;
+											$yadevices->writeLog("Ошибка в ответ на отправленную команду: ". $station['ANSWER'][$response_arr['requestId']]['command'].': '.$station['ANSWER'][$response_arr['requestId']]['value'].' - '.$response_arr['status']);
 										}
 										unset($stations[$key]['ANSWER'][$response_arr['requestId']]);
 									}
 								}
 								$state = $response_arr['state'];
-								if(!is_array($state)) continue;
-								$stateVolume = (float)($state['volume'] ?? 0);
-								$statePlaying = !empty($state['playing']);
+								//Очередь фраз: фраза договорена, когда Станция начала говорить и перестала
+								if(isset($stations[$key]['TTS_STATE'])){
+									$aliceState = (string)($state['aliceState'] ?? '');
+									if($aliceState == 'SPEAKING') $stations[$key]['TTS_STATE']['spoke'] = true;
+									else if(!empty($stations[$key]['TTS_STATE']['spoke'])) unset($stations[$key]['TTS_STATE']);
+								}
 								//Если прибавляли громкость, провераяем состояние Станции или убавляем по таймауту
 								if(isset($station['TVOLUME'])){
 									if((int)$station['TVOLUME']['start'] <= time()){
-										if(($state['aliceState'] ?? '')=='IDLE'){
+										if($state['aliceState']=='IDLE'){
 											$volRefresh = ['DATANAME'=>$key,'DATAVALUE'=>'setVolume^'.$station['TVOLUME']['volume']];
 											unset($stations[$key]['TVOLUME']);
 										}
 									}
-								} else if((float)($station['VOLUME'] ?? -1) != $stateVolume * 10){
-									$stations[$key]['VOLUME'] = $stateVolume * 10;
-									updateData($station, $stateVolume * 10, 'VOLUME');
+								} else if($station['VOLUME'] != $state['volume'] * 10){
+									$stations[$key]['VOLUME'] = $state['volume'] * 10;
+									updateData($station, $state['volume'] * 10, 'VOLUME');
 								}
-								$playing = $statePlaying ? 1 : 0;
-								if((int)($station['PLAYING'] ?? -1) != $playing){
+								if($station['PLAYING'] != $state['playing']){
+									$playing = $state['playing'] == true ? 1 : 0;
 									$stations[$key]['PLAYING'] = $playing;
-									SQLExec("UPDATE yastations SET PLAYING = " . $playing . " WHERE STATION_ID = '" . dbSafe($station['STATION_ID']) . "'");
+									SQLExec("UPDATE yastations SET PLAYING = '" . $playing . "' WHERE STATION_ID = '" . $station['STATION_ID'] . "'");
 									//Отправляем в вебсокет
-									postToWebSocket('YADEVICES_STATE_'.$station['ID'], ['playing'=>$statePlaying], 'PostEvent');
+									postToWebSocket('YADEVICES_STATE_'.$station['ID'], ['playing'=>$state['playing']], 'PostEvent');
 								}
-								if($statePlaying or $sendPlayerState){
-									if(isset($state['playerState']) and is_array($state['playerState']) and !empty($state['playerState']['title'])){
+								if($state['playing'] or $sendPlayerState){
+									if(isset($state['playerState']) and !empty($state['playerState']['title'])){
 										$playerState = $state['playerState'];
-										if(!empty($playerState['subtitle']) and ($station['ARTIST'] ?? '') != $playerState['subtitle']){
+										if(!empty($playerState['subtitle']) and $station['ARTIST'] != $playerState['subtitle']){
 											updateData($station, $playerState['subtitle'], 'ARTIST');
 											$stations[$key]['ARTIST'] = $playerState['subtitle'];
 										}
-										if(!empty($playerState['title']) and ($station['TRACK'] ?? '') != $playerState['title']){
+										if(!empty($playerState['title']) and $station['TRACK'] != $playerState['title']){
 											updateData($station, $playerState['title'], 'TRACK');
 											$stations[$key]['TRACK'] = $playerState['title'];
 										}
-										if(!empty($playerState['extra']['coverURI']) and ($station['COVER'] ?? '') != $playerState['extra']['coverURI']){
+										if(!empty($playerState['extra']['coverURI']) and $station['COVER'] != $playerState['extra']['coverURI']){
 											$cover = str_replace('%%', '', $playerState['extra']['coverURI']);
 											updateData($station, $cover, 'COVER');
 											$stations[$key]['COVER'] = $playerState['extra']['coverURI'];
 										}
 										//Отправляем в вебсокет
 										$cover = $playerState['extra']['coverURI'] ?? '';
-										postToWebSocket('YADEVICES_TRACKS_'.$station['ID'], ['on'=>true, 'title'=>$playerState['title'], 'subtitle'=>$playerState['subtitle'] ?? '', 'cover'=>$cover, 'duration'=>$playerState['duration'] ?? 0, 'progress'=>(int)($playerState['progress'] ?? 0), 'volume'=>round($stateVolume*10, 1), 'playing'=>$statePlaying], 'PostEvent');
+										postToWebSocket('YADEVICES_TRACKS_'.$station['ID'], ['on'=>true, 'title'=>$playerState['title'], 'subtitle'=>$playerState['subtitle'], 'cover'=>$cover, 'duration'=>$playerState['duration'], 'progress'=>(int)$playerState['progress'], 'volume'=>round($state['volume']*10, 1), 'playing'=>$state['playing']], 'PostEvent');
 									} else {
-										postToWebSocket('YADEVICES_TRACKS_'.$station['ID'], ['on'=>false, 'title'=>false, 'subtitle'=>false, 'cover'=>false, 'duration'=>0, 'progress'=>0, 'volume'=>round($stateVolume*10, 1), 'playing'=>$statePlaying, 'online'=>(int)($station['ONLINE'] ?? 0)], 'PostEvent');
+										postToWebSocket('YADEVICES_TRACKS_'.$station['ID'], ['on'=>false, 'title'=>false, 'subtitle'=>false, 'cover'=>false, 'duration'=>0, 'progress'=>0, 'volume'=>round($state['volume']*10, 1), 'playing'=>$state['playing'], 'online'=>$station['ONLINE'] = 0], 'PostEvent');
 									}
 									if($sendPlayerState){
-										postToWebSocket('YADEVICES_STATE_'.$station['ID'], ['playing'=>$statePlaying], 'PostEvent');
+										postToWebSocket('YADEVICES_STATE_'.$station['ID'], ['playing'=>$state['playing']], 'PostEvent');
 										$sendPlayerState = false;
 									}
 								}
@@ -317,68 +211,69 @@ $stations[$key]['IS_CONNECT'] = time();
 		$operations[] = $volRefresh;
 		$volRefresh = '';
 	}
-	$operationsCount = count($operations);
-	for ($i=0; $i<$operationsCount; $i++) {
+	//Очередь фраз: следующая фраза Станции, если предыдущая договорена или вышло время ожидания
+	foreach($stations as $key => $station){
+		if(empty($station['TTS_QUEUE'])) continue;
+		if(isset($station['TTS_STATE'])){
+			$elapsed = microtime(true) - $station['TTS_STATE']['sent'];
+			if(empty($station['TTS_STATE']['spoke']) ? $elapsed < TTS_START_WAIT : $elapsed < $station['TTS_STATE']['max']) continue;
+			unset($stations[$key]['TTS_STATE']);
+		}
+		if(!isset($station['CONNECT'])) continue;
+		while(!empty($stations[$key]['TTS_QUEUE'])){
+			$item = array_shift($stations[$key]['TTS_QUEUE']);
+			if($item['time'] < time() - TTS_QUEUE_TTL){
+				echo date("H:i:s").' Фраза для '.$station['TITLE'].' устарела в очереди и пропущена: '.$item['value'].PHP_EOL;
+				continue;
+			}
+			$operations[] = ['DATANAME'=>$key, 'DATAVALUE'=>$item['raw'], 'FROM_TTS_QUEUE'=>1];
+			break;
+		}
+	}
+	for ($i=0; $i<count($operations); $i++) {
 		$station_id = $operations[$i]["DATANAME"];
 		if(!empty($station_id)){
 			if(isset($stations[$station_id]['CONNECT'])){
-				if(strpos((string)$operations[$i]["DATAVALUE"], '^') !== false){
+				//Голосовые фразы - через очередь Станции, чтобы не обрывать текущую речь
+				$rawCommand = explode('^', (string)$operations[$i]["DATAVALUE"]);
+				if($rawCommand[0] == 'text' && empty($operations[$i]['FROM_TTS_QUEUE'])){
+					if(!isset($stations[$station_id]['TTS_QUEUE'])) $stations[$station_id]['TTS_QUEUE'] = [];
+					if(count($stations[$station_id]['TTS_QUEUE']) >= TTS_QUEUE_MAX) array_shift($stations[$station_id]['TTS_QUEUE']);
+					$stations[$station_id]['TTS_QUEUE'][] = ['raw'=>$operations[$i]["DATAVALUE"], 'value'=>$rawCommand[1] ?? '', 'time'=>time()];
+					continue;
+				}
+				if(stripos($operations[$i]["DATAVALUE"], '^')){
 					$data = explode('^', $operations[$i]["DATAVALUE"]);
 					$command = $data[0];
 					$value = $data[1];
 					if(isset($data[2])){
 						$stations[$station_id]['TVOLUME'] = ['start'=>time()+2, 'end'=>time() + 30, 'volume'=>$stations[$station_id]['VOLUME']*0.1];
 						echo date("H:i:s")." Отправляем на ".$stations[$station_id]['TITLE']." setVolume". ": " . $data[2]*0.1.PHP_EOL;
-						try {
-							$stations[$station_id]['CONNECT']->send($yadevices->message('setVolume', $data[2]*0.1, $stations[$station_id]['DEVICE_TOKEN']));
-						} catch (Throwable $e) {
-							logEvent('Ошибка отправки setVolume на ' . $stations[$station_id]['TITLE'] . ': ' . $e->getMessage(), true);
-						}
+						$stations[$station_id]['CONNECT']->send($yadevices->message('setVolume', $data[2]*0.1, $stations[$station_id]['DEVICE_TOKEN']));
 					}
 				} else {
 					$command = $operations[$i]["DATAVALUE"];
 					$value = '';
 				}
 				$id = uniqid('');
-				if(!isset($stations[$station_id]['ANSWER']) or !is_array($stations[$station_id]['ANSWER'])) $stations[$station_id]['ANSWER'] = [];
-				// Станция отвечает не на каждую команду, поэтому очередь ожидания
-				// чистится по времени и ограничена по длине - иначе она растёт без предела,
-				// а при переподключении все накопленные команды уходят на станцию повторно
-				foreach($stations[$station_id]['ANSWER'] as $oldId => $oldAnswer){
-					if(($oldAnswer['time'] ?? 0) < time() - ANSWER_TTL) unset($stations[$station_id]['ANSWER'][$oldId]);
-				}
-				while(count($stations[$station_id]['ANSWER']) >= ANSWER_MAX){
-					array_shift($stations[$station_id]['ANSWER']);
-				}
-				$stations[$station_id]['ANSWER'][$id] = ['command'=>$command,'value'=>$value,'time'=>time()];
+				$stations[$station_id]['ANSWER'] = [$id=>['command'=>$command,'value'=>$value]];
 				if($command == 'playerState') $sendPlayerState = true;
+				if(!empty($operations[$i]['FROM_TTS_QUEUE'])){
+					$stations[$station_id]['TTS_STATE'] = ['sent'=>microtime(true), 'spoke'=>false,
+						'max'=>min(TTS_MAX_WAIT, 5 + 0.12 * mb_strlen((string)$value))];
+				}
 				$message = $yadevices->message($command, $value, $stations[$station_id]['DEVICE_TOKEN'], $id);
 				if($value != '') $value = ': '.$value;
 				echo date("H:i:s")." Отправляем на ".$stations[$station_id]['TITLE']." " . $command . $value.PHP_EOL;
-				if(!empty($message)) {
-					try {
-						$stations[$station_id]['CONNECT']->send($message);
-					} catch (Throwable $e) {
-						logEvent('Ошибка отправки команды ' . $command . ' на ' . $stations[$station_id]['TITLE'] . ': ' . $e->getMessage(), true);
-						quasarDiagnosticStart($stations[$station_id]);
-$stations[$station_id]['IS_CONNECT'] = time();
-						unset($stations[$station_id]['CONNECT']);
-					}
-				}
+				if(!empty($message)) $stations[$station_id]['CONNECT']->send($message);
 			}
-			else logEvent('Станция ' . ($stations[$station_id]['TITLE'] ?? $station_id) . ' не в сети, сообщение не передано: '
-				. $operations[$i]["DATAVALUE"], true);
+			else echo date("H:i:s")." Станция ".$stations[$station_id]['TITLE']." не в сети. Сообщение не передано.".PHP_EOL;
 		}
 	}
 	
 	if ($latest_check_cycle + 15 < time()) {
        $latest_check_cycle = time();
-       setGlobal(CYCLE_NAME . 'Run', $latest_check_cycle, 1);
-       // раз в минуту дополнительно сохраняем снимок состояния для разбора аварий
-       if ($latest_state_saved + 60 < time()) {
-           $latest_state_saved = time();
-           saveCycleState($stations);
-       }
+       setGlobal((str_replace('.php', '', basename(__FILE__))) . 'Run', $latest_check_cycle, 1);
     }
 	
 	if ((time()-$latest_check) > $reloadTime) {
@@ -387,55 +282,17 @@ $stations[$station_id]['IS_CONNECT'] = time();
 	}
 	if (file_exists('./reboot') || isset($_GET['onetime'])) {
 		foreach($stations as $station){
-			// Соединение есть далеко не у каждой станции - вызов close() на пустом значении обрывал цикл фатальной ошибкой
-			if(!isset($station['CONNECT'])) continue;
-			try {
-				$station['CONNECT']->close();
-			} catch (Throwable $e) {
-				// станция уже отключена, закрывать нечего
-			}
+			$station['CONNECT']->close();
 		}
 		exit;
 	}
-}
-
-// Quasar transport diagnostics: elapsed time starts at detected loss,
-// or at the first connection attempt after cycle startup. Never log tokens.
-function quasarDiagnosticStart(&$station)
-{
-    if (($station['TITLE'] ?? '') !== 'Quasar') return;
-    if (!isset($station['DIAG_CONNECT_SINCE'])) {
-        $station['DIAG_CONNECT_SINCE'] = hrtime(true);
-        $station['DIAG_CONNECT_ATTEMPTS'] = 0;
-    }
-}
-
-function quasarDiagnosticConnected(&$station)
-{
-    if (($station['TITLE'] ?? '') !== 'Quasar') return;
-    $seconds = isset($station['DIAG_CONNECT_SINCE'])
-        ? max(0, (hrtime(true) - $station['DIAG_CONNECT_SINCE']) / 1000000000) : 0;
-    $reconnected = !empty($station['DIAG_CONNECTED_BEFORE']);
-    logEvent('Quasar ' . ($reconnected ? 'reconnected' : 'connected')
-        . '; ' . ($reconnected ? 'detected_outage_seconds=' : 'startup_connect_seconds=')
-        . number_format($seconds, 3, '.', '')
-        . '; attempts=' . (int)($station['DIAG_CONNECT_ATTEMPTS'] ?? 0)
-        . '; transport=websocket');
-    $station['DIAG_CONNECTED_BEFORE'] = true;
-    unset($station['DIAG_CONNECT_SINCE'], $station['DIAG_CONNECT_ATTEMPTS']);
 }
 
 function connect($stations){
 	global $yadevices;
 	//Подключаемся к Станциям, у которых прописан локальный IP и получен токен
 	foreach($stations as $key=>$station){
-		// Переменная переиспользуется в цикле: без сброса станция могла получить соединение соседней станции
-		unset($connect);
 		if($station['IS_CONNECT'] != 0 and $station['IS_CONNECT'] <= time()){
-            quasarDiagnosticStart($stations[$key]);
-            if (($station['TITLE'] ?? '') === 'Quasar') {
-                $stations[$key]['DIAG_CONNECT_ATTEMPTS']++;
-            }
 			if(!empty($station['IP']) and !empty($station['DEVICE_TOKEN'])){
 				if(!isset($station['CONNECTION_OFF'])){
 					echo date('H:i:s') . ' Устанавливаем соединение с '. $station['TITLE'];
@@ -444,24 +301,19 @@ function connect($stations){
 					$url = $yadevices->refreshDevices();
 					if(!$url){
 						if(!isset($station['CONNECTION_OFF'])){
-							echo '.....URL не получен. Повторные попытки с паузой от '. RECONNECT_TIME .' до '. RECONNECT_MAX_TIME .' секунд.'.PHP_EOL;
+							echo '.....URL не получен. Попытки подключения раз в '. RECONNECT_TIME .' секунд.'.PHP_EOL;
 							$stations[$key]['CONNECTION_OFF'] = 1;
 						}
-						// При затяжном сбое облака пауза растёт: 1, 2, 3, 4, 5, 5… минут
-						$fails = (int)($station['URL_FAILS'] ?? 0) + 1;
-						$stations[$key]['URL_FAILS'] = $fails;
-						$stations[$key]['IS_CONNECT'] = time() + min(RECONNECT_TIME * $fails, RECONNECT_MAX_TIME);
+						$stations[$key]['IS_CONNECT'] = time()+RECONNECT_TIME;
 						continue;
 					}
 					$quazarConfig = new ClientConfig();
 					$quazarConfig->setTimeout(1);
 					try{
 						$connect = new WebSocketClient($url, $quazarConfig);
-					} catch(Throwable $e) {
+					} catch(Exception $e) {
 						if(!isset($station['CONNECTION_OFF'])){
 							echo '.....Не успешно. Попытки подключения раз в '. RECONNECT_TIME .' секунд.'.PHP_EOL;
-							logEvent('Подключение к облаку не удалось: ' . $e->getMessage()
-								. '. Повтор раз в ' . RECONNECT_TIME . ' секунд.', true);
 							$stations[$key]['CONNECTION_OFF'] = 1;
 						}
 						$stations[$key]['IS_CONNECT'] = time()+RECONNECT_TIME;
@@ -473,22 +325,20 @@ function connect($stations){
 					$glagolConfig->setTimeout(1);
 					try{
 						$connect = new WebSocketClient('wss://'. $station['IP'].':'.GLAGOL_PORT, $glagolConfig);
-					} catch(Throwable $e) {
+					} catch(Exception $e) {
 						unset($connect);
 						unset($stations[$key]['CONNECT']);
 					}
 				}
 				if(isset($connect)){
-					$token = $station['DEVICE_TOKEN'] ?? '';
 					if($station['TITLE'] != 'Quasar'){
 						//Обновляем токен
 						$token = $yadevices->getDeviceToken($station['STATION_ID'], $station['PLATFORM']);
 						if(!$token){
 							$stations[$key]['IS_CONNECT'] = time()+RECONNECT_TIME;
-							logEvent('Ошибка получения локального токена для ' . $station['TITLE']
-								. ', соединение разорвано. Повтор раз в ' . RECONNECT_TIME . ' секунд.', true);
+							echo date('H:i:s') . '.....ошибка получения токена! Разрываем соединение. Попытки подключения раз в '. RECONNECT_TIME .' секунд.'.PHP_EOL;
 							$stations[$key]['CONNECTION_OFF'] = 1;
-							try { $connect->close(); } catch (Throwable $e) {}
+							$connect->close();
 							continue;
 						} else {
 							$stations[$key]['DEVICE_TOKEN'] = $token;
@@ -500,8 +350,6 @@ function connect($stations){
 					$stations[$key]['CONNECT'] = $connect;
 					$stations[$key]['LAST_MESSAGE'] = time();
 					$stations[$key]['IS_CONNECT'] = 0;
-					unset($stations[$key]['URL_FAILS']);
-                    quasarDiagnosticConnected($stations[$key]);
 					if(!isset($station['CONNECTION_OFF'])){
 						echo '.....Успешно!'.PHP_EOL;
 					} else {
@@ -509,18 +357,10 @@ function connect($stations){
 						unset($stations[$key]['CONNECTION_OFF']);
 					}
 					//Если есть неотправленное сообщение, например, при устаревании токена (Invalid token)
-					if(isset($station['ANSWER']) and is_array($station['ANSWER'])){
+					if(is_array($station['ANSWER'])){
 						foreach($station['ANSWER'] as $id=>$answer){
-							if(($answer['time'] ?? 0) < time() - ANSWER_TTL){
-								unset($stations[$key]['ANSWER'][$id]);
-								continue;
-							}
-							try {
-								$connect->send($yadevices->message($answer['command'], $answer['value'], $token, $id));
-								echo date("H:i:s")." Повторно отправляем на ".$station['TITLE']. " " . $answer['command'] .": ". $answer['value'].PHP_EOL;
-							} catch (Throwable $e) {
-								logEvent('Ошибка повторной отправки на ' . $station['TITLE'] . ': ' . $e->getMessage(), true);
-							}
+							$connect->send($yadevices->message($answer['command'], $answer['value'], $token, $id));
+							echo date("H:i:s")." Повторно отправляем на ".$station['TITLE']. " " . $answer['command'] .": ". $answer['value'].PHP_EOL;
 						}
 					}
 				} else {
@@ -531,8 +371,6 @@ function connect($stations){
 					}
 					if(!isset($station['CONNECTION_OFF'])){
 						echo '.....Не успешно. Попытки подключения раз в '. RECONNECT_TIME .' секунд.'.PHP_EOL;
-						logEvent('Подключение к ' . $station['TITLE'] . ' (' . $station['IP'] . ') не удалось. Повтор раз в '
-							. RECONNECT_TIME . ' секунд.', true);
 						$stations[$key]['CONNECTION_OFF'] = 1;
 					} 
 				}
@@ -544,25 +382,17 @@ function connect($stations){
 
 function updateData($station, $value, $prop){
 	global $yadevices;
-	$allowedProps = ['ARTIST', 'TRACK', 'COVER', 'VOLUME', 'PLAYING', 'online'];
-	if(!in_array($prop, $allowedProps, true)) return;
-	if(empty($station['IOT_ID'])) return;
-
-	// Запись читается до формирования $params: раньше ALLOWPARAMS всегда уходил пустым
-	$property = SQLSelectOne("SELECT yadevices_capabilities.* FROM yadevices_capabilities LEFT JOIN yadevices ON yadevices_capabilities.YADEVICE_ID=yadevices.ID WHERE yadevices.IOT_ID='" . dbSafe($station['IOT_ID']) . "' AND yadevices_capabilities.TITLE='local." . dbSafe(strtolower($prop)) . "'");
-
-	$params = array();
+	//if(strlen($value) > 255) $yadevices->writeLog($value);
 	if($prop != 'online'){
-		SQLExec("UPDATE yastations SET `".$prop."` = '" . dbSafe($value) . "' WHERE STATION_ID = '" . dbSafe($station['STATION_ID']) . "'");
-		$params['OLD_VALUE'] = $station[$prop] ?? '';
+		SQLExec("UPDATE yastations SET ".$prop." = '" . dbSafe($value) . "' WHERE STATION_ID = '" . $station['STATION_ID'] . "'");
+		$params['OLD_VALUE'] = $station[$prop];
 		$params['DEVICE_STATE'] = '1';
 		$params['ALLOWPARAMS'] = $property['ALLOWPARAMS'] ?? '';
 		$params['UPDATED'] = date('Y-m-d H:i:s');
 		$params['MODULE'] = 'yadevices';
 	}
 	$params['NEW_VALUE'] = $value;
-
-	if(empty($property['ID'])) return;
+	$property = SQLSelectOne("SELECT yadevices_capabilities.* FROM yadevices_capabilities LEFT JOIN yadevices ON yadevices_capabilities.YADEVICE_ID=yadevices.ID WHERE yadevices.IOT_ID LIKE '" . $station['IOT_ID'] . "' AND yadevices_capabilities.TITLE LIKE 'local." .strtolower($prop). "'");
 	$yadevices->setProperty($property, $value, $params);
 	$property['VALUE'] = $value;
 	$property['UPDATED'] = date('Y-m-d H:i:s');
